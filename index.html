@@ -741,6 +741,8 @@
         let fastSessionLog = [];
         let html5QrCodeScanner = null;
         let isCameraActive = false;
+        let isProcessingScan = false;
+        let autoSyncInterval = null;
         let scriptUrl = localStorage.getItem(SHEETS_SCRIPT_KEY) || DEFAULT_SHEETS_URL;
 
         function toggleMaintNoteField() {
@@ -759,12 +761,27 @@
             if (scriptUrl) {
                 document.getElementById('sheets-script-url').value = scriptUrl;
                 document.getElementById('sheets-sync-dot')?.classList.remove('hidden');
-                syncDataFromSheets();
+                syncDataFromSheets(true);
             } else {
                 loadData();
             }
             renderStats();
             renderList();
+
+            // Auto sync data saat pengguna kembali ke tab browser HP
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden && scriptUrl) {
+                    syncDataFromSheets(true);
+                }
+            });
+
+            // Periodic background sync setiap 8 detik agar data selalu terkini antar-device
+            if (autoSyncInterval) clearInterval(autoSyncInterval);
+            autoSyncInterval = setInterval(() => {
+                if (scriptUrl && !document.hidden && !isCameraActive) {
+                    syncDataFromSheets(true);
+                }
+            }, 8000);
         });
 
         function loadData() {
@@ -790,40 +807,40 @@
         async function pushDataToSheets() {
             if (!scriptUrl) return;
             try {
-                showToast('Mengunggah perubahan ke Google Sheets...', 'info');
-                await fetch(scriptUrl, {
-                    method: 'POST',
-                    mode: 'no-cors',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(items)
-                });
-                showToast('Tersimpan di Google Sheets', 'success');
-            } catch (err) {
-                console.error("Gagal push ke Sheets:", err);
-            }
-        }
-
-        async function syncDataFromSheets() {
+        async function syncDataFromSheets(silent = false) {
             scriptUrl = document.getElementById('sheets-script-url').value.trim() || scriptUrl;
             if (!scriptUrl) {
-                showToast('Masukkan URL Apps Script terlebih dahulu', 'warning');
+                if (!silent) showToast('Masukkan URL Apps Script terlebih dahulu', 'warning');
                 return;
             }
 
-            showToast('Menghubungkan ke Google Sheets...', 'info');
+            if (!silent) showToast('Menghubungkan ke Google Sheets...', 'info');
             try {
                 const res = await fetch(scriptUrl);
-                const data = await res.json();
+                const textData = await res.text();
+                
+                // Cek jika respon mengembalikan HTML login Google bukan JSON
+                if (textData.trim().startsWith('<')) {
+                    if (!silent) {
+                        showToast('Izin Apps Script belum set "Anyone". Silakan ikuti petunjuk setting!', 'danger');
+                    }
+                    return;
+                }
+
+                const data = JSON.parse(textData);
                 if (Array.isArray(data)) {
-                    items = data;
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-                    renderStats();
-                    renderList();
-                    showToast('Data berhasil disinkronkan dari Google Sheets!', 'success');
+                    // Update lokal jika ada perubahan data dari Google Sheets
+                    if (JSON.stringify(items) !== JSON.stringify(data)) {
+                        items = data;
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+                        renderStats();
+                        renderList();
+                        if (!silent) showToast('Data disinkronkan dari Google Sheets!', 'success');
+                    }
                 }
             } catch (err) {
                 console.error("Gagal sync dari Sheets:", err);
-                showToast('Gagal menarik data dari Google Sheets. Pastikan Web App URL valid!', 'danger');
+                if (!silent) showToast('Gagal menarik data dari Google Sheets.', 'danger');
             }
         }
 
@@ -1330,17 +1347,17 @@ function doPost(e) {
 
         function handleFastScanTyping(e) {
             if (e.key === 'Enter') {
-                searchFastScanTarget();
+                searchFastScanTarget(false);
             }
         }
 
-        function searchFastScanTarget() {
+        function searchFastScanTarget(silent = false) {
             const query = document.getElementById('fast-scan-input').value.trim().toLowerCase();
-            if (!query) return;
+            if (!query) return false;
 
             const target = items.find(i => 
                 i.code.toLowerCase() === query || 
-                i.code.toLowerCase().includes(query) ||
+                i.code.toLowerCase().replace(/[^a-z0-9]/g, '') === query.replace(/[^a-z0-9]/g, '') ||
                 (i.sn && i.sn.toLowerCase() === query)
             );
 
@@ -1364,8 +1381,12 @@ function doPost(e) {
 
                 document.getElementById('fast-target-card').classList.remove('hidden');
                 playBeepSound();
+                return true;
             } else {
-                showToast(`Kode "${query}" tidak ditemukan!`, 'danger');
+                if (!silent) {
+                    showToast(`Kode "${query}" tidak ditemukan!`, 'danger');
+                }
+                return false;
             }
         }
 
@@ -1567,7 +1588,7 @@ function doPost(e) {
                 }
 
                 const config = {
-                    fps: 12,
+                    fps: 15,
                     qrbox: (viewfinderWidth, viewfinderHeight) => {
                         const minEdge = Math.min(viewfinderWidth, viewfinderHeight);
                         return {
@@ -1578,12 +1599,28 @@ function doPost(e) {
                     aspectRatio: 1.333333
                 };
 
-                const onScanSuccess = (decodedText) => {
-                    document.getElementById('fast-scan-input').value = decodedText;
-                    searchFastScanTarget();
+                isProcessingScan = false;
+                const onScanSuccess = async (decodedText) => {
+                    if (isProcessingScan) return;
+                    isProcessingScan = true;
+
+                    const cleanCode = decodedText.trim();
+                    document.getElementById('fast-scan-input').value = cleanCode;
                     
-                    if (navigator.vibrate) {
-                        navigator.vibrate(100);
+                    // Cari secara silent (tanpa spam toast error jika scan parsial)
+                    const isFound = searchFastScanTarget(true);
+
+                    if (isFound) {
+                        // Matikan kamera secara otomatis jika barcode cocok!
+                        await stopCameraScanner();
+                        if (navigator.vibrate) {
+                            navigator.vibrate(100);
+                        }
+                    } else {
+                        // Debounce singkat sebelum membaca frame berikutnya
+                        setTimeout(() => {
+                            isProcessingScan = false;
+                        }, 600);
                     }
                 };
 
@@ -1615,7 +1652,7 @@ function doPost(e) {
 
                 let errorMsg = 'Gagal membuka kamera.';
                 if (window.location.protocol === 'file:') {
-                    errorMsg = 'Browser memblokir Kamera Live untuk file://. Gunakan tombol "Foto Barcode" di samping atau jalankan via Live Server / HTTPS!';
+                    errorMsg = 'Browser memblokir Kamera Live untuk file://. Gunakan tombol "Foto Barcode" di samping atau jalankan via HTTPS!';
                 } else if (err && (err.name === 'NotAllowedError' || err.toString().includes('NotAllowedError'))) {
                     errorMsg = 'Izin kamera ditolak. Silakan izinkan akses kamera di pengaturan browser HP Anda.';
                 } else if (err && err.name === 'NotFoundError') {
@@ -1633,6 +1670,7 @@ function doPost(e) {
                     console.error("Error stopping scanner", err);
                 } finally {
                     isCameraActive = false;
+                    isProcessingScan = false;
                     document.getElementById('camera-reader-container').classList.add('hidden');
                     document.getElementById('cam-btn-text').innerText = 'Buka Kamera HP';
                 }
@@ -1651,11 +1689,13 @@ function doPost(e) {
                 }
                 const decodedText = await html5QrCodeScanner.scanFile(file, false);
                 document.getElementById('fast-scan-input').value = decodedText;
-                searchFastScanTarget();
-                showToast(`Barcode terdeteksi: <b>${decodedText}</b>`, 'success');
+                const isFound = searchFastScanTarget(false);
+                if (isFound) {
+                    showToast(`Barcode terdeteksi: <b>${decodedText}</b>`, 'success');
+                }
             } catch (err) {
                 console.error("Scan file error:", err);
-                showToast('Barcode tidak terdeteksi pada foto. Pastikan foto terpecah jelas & terang!', 'danger');
+                showToast('Barcode tidak terdeteksi pada foto. Pastikan foto jelas & terang!', 'danger');
             } finally {
                 input.value = '';
             }
